@@ -427,16 +427,11 @@ private:
         tableint next_closest_entry_point = selectedNeighbors[0];
 
         {
+            SpinLock lock(link_list_locks_ + cur_c);
             linklistsizeint* ll_cur = getLinklist(cur_c, level);
-            if(!isUpdate && getListCount(ll_cur)) {
-                throw std::runtime_error("The newly inserted element should have blank link list");
-            }
             setListCount(ll_cur, selectedNeighbors.size());
             tableint* links = (tableint*)(ll_cur + 1);
             for(size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
-                if(!isUpdate && links[idx]) {
-                    throw std::runtime_error("Possible memory corruption");
-                }
                 if(level > element_levels_[selectedNeighbors[idx]]) {
                     throw std::runtime_error("Trying to make a link on a non-existent level");
                 }
@@ -452,9 +447,6 @@ private:
 
             if(sz_link_list_other > Mcurmax) {
                 throw std::runtime_error("Bad value of sz_link_list_other");
-            }
-            if(selectedNeighbors[idx] == cur_c) {
-                throw std::runtime_error("Trying to connect an element to itself");
             }
             if(level > element_levels_[selectedNeighbors[idx]]) {
                 throw std::runtime_error("Trying to make a link on a non-existent level");
@@ -1150,7 +1142,6 @@ public:
 
         // Take update lock to prevent race conditions on an element with insertion/update at the same time.
         std::unique_lock<std::mutex> lock_el_update(link_list_update_locks_[(cur_c & (max_update_element_locks - 1))]);
-        SpinLock lock_el(link_list_locks_ + cur_c);
         int curlevel = getRandomLevel(mult_);
         if(level > 0) {
             curlevel = level;
