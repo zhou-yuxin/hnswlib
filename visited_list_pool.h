@@ -1,5 +1,6 @@
 #pragma once
 
+#include <list>
 #include <mutex>
 
 #include <stdint.h>
@@ -14,18 +15,18 @@ class VisitedList {
 private:
     vl_type tag;
     vl_type* array;
-    size_t numelements;
+    size_t nelement;
 
 public:
-    VisitedList(size_t numelements) : numelements(numelements) {
+    VisitedList(size_t nelement) : nelement(nelement) {
         tag = vl_type(-1);
-        array = new vl_type[numelements];
+        array = new vl_type[nelement];
     }
 
     void reset() {
         tag++;
         if(tag == 0) {
-            memset(array, 0, numelements * sizeof(vl_type));
+            memset(array, 0, nelement * sizeof(vl_type));
             tag++;
         }
     };
@@ -47,43 +48,42 @@ public:
 class VisitedListPool {
 
 private:
-    std::deque<VisitedList*> pool;
-    std::mutex poolguard;
-    size_t numelements;
+    size_t nelement;
+    std::list<VisitedList*> pool;
+    std::mutex lock;
 
 public:
-    VisitedListPool(size_t initmaxpools, size_t numelements) : numelements(numelements) {
-        for(size_t i = 0; i < initmaxpools; i++) {
-            pool.push_front(new VisitedList(numelements));
+    VisitedListPool(size_t nelement, size_t ninstance = 1) : nelement(nelement) {
+        for(size_t i = 0; i < ninstance; i++) {
+            pool.push_back(new VisitedList(nelement));
         }
     }
 
     VisitedList* getFreeVisitedList() {
-        VisitedList* rez;
-        {
-            std::unique_lock<std::mutex> lock(poolguard);
-            if(pool.size() > 0) {
-                rez = pool.front();
-                pool.pop_front();
-            }
-            else {
-                rez = new VisitedList(numelements);
-            }
+        VisitedList* instance;
+        std::unique_lock<std::mutex> l(lock);
+        if(pool.empty()) {
+            instance = new VisitedList(nelement);
         }
-        rez->reset();
-        return rez;
+        else {
+            instance = pool.back();
+            pool.pop_back();
+        }
+        l.unlock();
+        instance->reset();
+        return instance;
     }
 
-    void releaseVisitedList(VisitedList* vl) {
-        std::unique_lock<std::mutex> lock(poolguard);
-        pool.push_front(vl);
+    void releaseVisitedList(VisitedList* instance) {
+        std::unique_lock<std::mutex> l(lock);
+        pool.push_back(instance);
     }
 
     ~VisitedListPool() {
-        while(pool.size()) {
-            VisitedList* rez = pool.front();
-            pool.pop_front();
-            delete rez;
+        while(!pool.empty()) {
+            VisitedList* instance = pool.back();
+            pool.pop_back();
+            delete instance;
         }
     }
 

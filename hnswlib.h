@@ -13,28 +13,14 @@
 #endif
 #endif
 #endif
-#endif
-
-#if defined(USE_AVX) || defined(USE_SSE)
-#ifdef _MSC_VER
-#include <intrin.h>
-#include <stdexcept>
-#else
 #include <x86intrin.h>
-#endif
-
-#if defined(__GNUC__)
-#define PORTABLE_ALIGN32 __attribute__((aligned(32)))
-#else
-#define PORTABLE_ALIGN32 __declspec(align(32))
-#endif
 #endif
 
 #include <queue>
 
 namespace hnswlib {
 
-typedef size_t labeltype;
+typedef size_t label_t;
 
 using VPFUNC = void (*)(void*, size_t);
 
@@ -51,7 +37,7 @@ public:
 
     virtual ~SpaceInterface() {}
 
-    size_t getDim() const {
+    inline size_t getDim() const {
         return d;
     }
 
@@ -67,7 +53,9 @@ public:
 
     virtual DISTFUNC<Tdist> getDistFunc() const = 0;
 
-    virtual inline DISTFUNC<Tdist> getDistFuncST() const = 0;
+    virtual inline  DISTFUNC<Tdist> getDistFuncST() const {
+        return getDistFunc();
+    }
 
 };
 
@@ -90,9 +78,10 @@ class AlgorithmInterface {
 public:
     virtual ~AlgorithmInterface() {}
 
-    virtual void addPoint(const void* point, labeltype label) = 0;
+    virtual void addPoint(const void* point, label_t label) = 0;
 
-    virtual std::priority_queue<std::pair<Tdist, labeltype>> searchKnn(const void* point, size_t topk) const = 0;
+    virtual std::priority_queue<std::pair<Tdist, label_t>> searchKnn(const void* point,
+            size_t topk) const = 0;
 
 };
 

@@ -19,15 +19,15 @@ template <typename Tdist, typename Tcorr>
 class InnerProductSpace : public SpaceInterface<Tdist> {
 
 private:
-    size_t raw_data_size_;
+    size_t raw_data_size;
 
 public:
     InnerProductSpace(size_t d): SpaceInterface<Tdist>(d) {
-        raw_data_size_ = d * sizeof(Tcorr);
+        raw_data_size = d * sizeof(Tcorr);
     }
 
     size_t getRawDataSize() const override {
-        return raw_data_size_;
+        return raw_data_size;
     }
 
     DISTFUNC<Tdist> getDistFunc() const override {

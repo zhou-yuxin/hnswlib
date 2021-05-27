@@ -41,15 +41,15 @@ template <typename Tdist, typename Tcorr>
 class L2Space : public SpaceInterface<Tdist> {
 
 private:
-    size_t raw_data_size_;
+    size_t raw_data_size;
 
 public:
     L2Space(size_t dim): SpaceInterface<Tdist>(dim) {
-        raw_data_size_ = dim * sizeof(Tcorr);
+        raw_data_size = dim * sizeof(Tcorr);
     }
 
     size_t getRawDataSize() const override {
-        return raw_data_size_;
+        return raw_data_size;
     }
 
     DISTFUNC<Tdist> getDistFunc() const override {
@@ -75,6 +75,7 @@ public:
 #endif
 
     ~L2Space() {}
+
 };
 
 }
