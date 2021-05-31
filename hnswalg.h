@@ -3,12 +3,14 @@
 #include <list>
 #include <atomic>
 #include <random>
+#include <vector>
 #include <cassert>
 #include <unordered_map>
 #include <unordered_set>
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 #include "hnswlib.h"
 #include "visited_list_pool.h"
@@ -39,28 +41,43 @@ private:
         volatile uint8_t* byte;
         uint8_t mask;
 
-        SpinLock(void* bitlocks, id_t id) {
-            byte = (uint8_t*)bitlocks + id / 8;
+        SpinLock(uint8_t* bitlocks, id_t id) {
+            byte = bitlocks + id / 8;
             mask = 1 << (id % 8);
-            while(true) {
-                uint8_t snap = *byte;
-                if(snap & mask) {
-                    continue;
-                }
-                if(__sync_bool_compare_and_swap(byte, snap, snap | mask)) {
-                    break;
-                }
-            }
+            while(__sync_fetch_and_or(byte, mask) & mask);
         }
 
         ~SpinLock() {
-            while(true) {
-                uint8_t snap = *byte;
-                assert(snap & mask);
-                if(__sync_bool_compare_and_swap(byte, snap, snap & (~mask))) {
-                    break;
-                }
-            }
+            uint8_t snap = __sync_fetch_and_and(byte, ~mask);
+            assert(snap & mask);
+        }
+    };
+
+    struct ReaderLock {
+        pthread_rwlock_t* lock;
+
+        inline ReaderLock(pthread_rwlock_t* lock): lock(lock) {
+            int ret = pthread_rwlock_rdlock(lock);
+            assert(ret == 0);
+        }
+
+        inline ~ReaderLock() {
+            int ret = pthread_rwlock_unlock(lock);
+            assert(ret == 0);
+        }
+    };
+
+    struct WriterLock {
+        pthread_rwlock_t* lock;
+
+        inline WriterLock(pthread_rwlock_t* lock): lock(lock) {
+            int ret = pthread_rwlock_wrlock(lock);
+            assert(ret == 0);
+        }
+
+        inline ~WriterLock() {
+            int ret = pthread_rwlock_unlock(lock);
+            assert(ret == 0);
         }
     };
 
@@ -100,21 +117,21 @@ private:
 
     level_t* levels_;
     void** linklists_;
-    void* bitlocks_;
+    uint8_t* bitlocks_;
 
     Level0StorageInterface* level0_storage_;
     void* level0_raw_memory_;
 
     std::vector<id_t> free_ids_;
+    std::unordered_map<label_t, id_t> label_lookup_;
 
     std::default_random_engine random_;
 
+    std::mutex global_lock_;
+    pthread_rwlock_t add_rwlock_;
+
     size_t ef_;
     VisitedListPool* visited_list_pool_;
-
-    std::unordered_map<label_t, id_t> label_lookup_;
-
-    std::mutex global_lock_;
 
 public:
     mutable std::atomic<uint64_t> metric_hops;
@@ -438,11 +455,12 @@ public:
             throw std::runtime_error("out of memory");
         }
 
-        bitlocks_ = malloc(max_elements_ / 8 + 1);
+        size_t bitlock_len = max_elements_ / 8 + 1;
+        bitlocks_ = (uint8_t*)malloc(bitlock_len);
         if(bitlocks_ == nullptr) {
             throw std::runtime_error("out of memory"); 
         }
-        memset(bitlocks_, 0, max_elements_ / 8 + 1);
+        memset(bitlocks_, 0, bitlock_len);
 
         level0_storage_ = level0_storage;
         size_t level0_len = size_data_per_element_ * max_elements_;
@@ -454,6 +472,9 @@ public:
         }
 
         random_.seed(random_seed);
+
+        int ret = pthread_rwlock_init(&add_rwlock_, nullptr);
+        assert(ret == 0);
 
         ef_ = 10;
         visited_list_pool_ = new VisitedListPool(max_elements_);
@@ -473,9 +494,11 @@ public:
         free(levels_);
         free(bitlocks_);
         free(linklists_);
-        delete visited_list_pool_;
         level0_storage_->free(level0_raw_memory_, max_elements_ * size_data_per_element_);
         delete level0_storage_;
+        delete visited_list_pool_;
+        int ret = pthread_rwlock_destroy(&add_rwlock_);
+        assert(ret == 0);
     }
 
     inline size_t getM() const {
@@ -498,19 +521,20 @@ public:
         ef_ = ef;
     }
 
-    inline size_t getMaxElement() const {
+    inline size_t getMaxCount() const {
         return max_elements_;
     }
 
-    inline size_t getElementCount() const {
-        return max_elements_ - free_ids_.size();
+    inline size_t getFreeCount() const {
+        return free_ids_.size();
     }
 
-    inline void addPoint(const void* data_point, label_t label) {
+    inline void addPoint(const void* data_point, label_t label) override {
         addPoint(data_point, label, -1);
     }
 
     id_t addPoint(const void* data_point, label_t label, int level) {
+        ReaderLock add_rlock(&add_rwlock_);
         std::unique_lock<std::mutex> glock(global_lock_);
         auto found = label_lookup_.find(label);
         if(found != label_lookup_.end()) {
@@ -600,30 +624,48 @@ public:
         id_t id = found->second;
         label_lookup_.erase(found);
         setStatus(id, Status::DISABLED);
+    }
 
-        if(id == enterpoint_id_) {
-            SpinLock lock(bitlocks_, id);
-            const LinkList* linklist = getLinkList(id, enterpoint_level_);
+    void recycleDisabledPoints(size_t nthread = 1) {
+        std::unique_lock<std::mutex> glock(global_lock_);
+        if(isDisabled(enterpoint_id_)) {
             bool found = false;
-            for(listsize_t i = 0; i < linklist->size; i++) {
-                id_t id_i = linklist->ids[i];
-                if(isEnabled(id_i)) {
-                    enterpoint_id_ = id_i;
-                    found = true;
-                    break;
+            {
+                SpinLock lock(bitlocks_, enterpoint_id_);
+                const LinkList* linklist = getLinkList(enterpoint_id_, enterpoint_level_);
+                for(listsize_t i = 0; i < linklist->size; i++) {
+                    id_t id_i = linklist->ids[i];
+                    if(isEnabled(id_i)) {
+                        enterpoint_id_ = id_i;
+                        found = true;
+                        break;
+                    }
                 }
             }
+
             if(!found) {
                 int alt_level = -1;
                 id_t alt_id = id_t(-1);
-                for(id_t id = 0; id < max_elements_; id++) {
-                    if(isEnabled(id)) {
-                        if(int(levels_[id]) > alt_level) {
-                            alt_level = levels_[id];
-                            alt_id = id;
+                #pragma omp parallel num_threads(nthread)
+                {
+                    int alt_level_local = -1;
+                    id_t alt_id_local = id_t(-1);
+                    #pragma omp for
+                    for(id_t id = 0; id < max_elements_; id++) {
+                        if(isEnabled(id)) {
+                            if(int(levels_[id]) > alt_level_local) {
+                                alt_level_local = levels_[id];
+                                alt_id_local = id;
+                            }
                         }
                     }
+                    #pragma omp critical
+                    if(alt_level_local > alt_level) {
+                        alt_level = alt_level_local;
+                        alt_id = alt_id_local;
+                    }
                 }
+
                 if(alt_id == id_t(-1)) {
                     throw std::runtime_error("enterpoint is the only enabled point");
                 }
@@ -632,14 +674,20 @@ public:
             }
         }
         assert(isEnabled(enterpoint_id_));
-    }
+        glock.unlock();
 
-    void offlineDisabledPoints(size_t nthread = 1) {
+        std::vector<id_t> disabled_ids;
+
         #pragma omp parallel for num_threads(nthread) schedule(dynamic)
         for(id_t id = 0; id < max_elements_; id++) {
             if(isFree(id)) {
                 continue;
             }
+            if(isDisabled(id)) {
+                #pragma omp critical
+                disabled_ids.push_back(id);
+            }
+
             for(int l = levels_[id]; l >= 0; l--) {
                 std::vector<id_t> enabled_ids, disabled_ids;
                 enabled_ids.reserve(l ? max_M_ : max_M0_);
@@ -697,67 +745,56 @@ public:
                 }
             }
         }
-    }
 
-    void recycleDisabledPoints(size_t nthread = 1) {
-        std::vector<id_t> ids;
-        std::unordered_set<id_t> linked_ids;
-
-        #pragma omp parallel num_threads(nthread)
         {
-            std::vector<id_t> local_ids;
-            std::unordered_set<id_t> local_linked_ids;
+            WriterLock add_wlock(&add_rwlock_);
+        }
 
-            #pragma omp for schedule(dynamic)
-            for(id_t id = 0; id < max_elements_; id++) {
-                if(isFree(id)) {
-                    continue;
-                }
-                if(isDisabled(id)) {
-                    local_ids.push_back(id);
-                }
-                for(int l = levels_[id]; l >= 0; l--) {
-                    SpinLock lock(bitlocks_, id);
-                    const LinkList* linklist = getLinkList(id, l);
-                    for(listsize_t i = 0; i < linklist->size; i++) {
-                        id_t id_i = linklist->ids[i];
-                        if(isDisabled(id_i)) {
-                            local_linked_ids.insert(id_i);
-                        }
-                    }
-                }
+        size_t bitmap_len = max_elements_ / 8 + 1;
+        uint8_t* linked_bitmap = new uint8_t [bitmap_len];
+        memset(linked_bitmap, 0, bitmap_len);
+
+        #pragma omp parallel for num_threads(nthread) schedule(dynamic)
+        for(id_t id = 0; id < max_elements_; id++) {
+            if(isFree(id)) {
+                continue;
             }
-
-            #pragma omp critical
-            {
-                ids.insert(ids.end(), local_ids.begin(), local_ids.end());
-                linked_ids.insert(local_linked_ids.begin(), local_linked_ids.end());
+            for(int l = levels_[id]; l >= 0; l--) {
+                SpinLock lock(bitlocks_, id);
+                const LinkList* linklist = getLinkList(id, l);
+                for(listsize_t i = 0; i < linklist->size; i++) {
+                    id_t id_i = linklist->ids[i];
+                    __sync_fetch_and_or(linked_bitmap + id_i / 8, 1 << (id_i % 8));
+                }
             }
         }
-        assert(ids.size() >= linked_ids.size());
 
         #pragma omp parallel for num_threads(nthread)
-        for(size_t i = 0; i < ids.size(); i++) {
-            id_t id = ids[i];
-            if(linked_ids.find(id) == linked_ids.end()) {
+        for(size_t i = 0; i < disabled_ids.size(); i++) {
+            id_t id = disabled_ids[i];
+            if(!(linked_bitmap[id / 8] & (1 << (id % 8)))) {
                 setStatus(id, Status::FREE);
                 if(levels_[id] > 0) {
                     free(linklists_[id]);
-                    linklists_[id] = nullptr;
                     levels_[id] = 0;
                 }
                 #pragma omp critical
-                {
-                    free_ids_.push_back(id);
-                }
+                free_ids_.push_back(id);
             }
         }
+
+        delete linked_bitmap;
+    }
+
+    inline std::priority_queue<std::pair<Tdist, label_t>> searchKnn(const void* data_point, size_t k)
+            const override {
+        return searchKnn<false>(k, data_point);
     }
 
     template <bool collect_metrics>
     std::priority_queue<std::pair<Tdist, label_t>> searchKnn(size_t k, const void* data_point) const {
         std::priority_queue<std::pair<Tdist, label_t>> result;
-        if(getElementCount() == 0) {
+        if(getMaxCount() == getFreeCount()) {
             return result;
         }
 
@@ -804,10 +841,6 @@ public:
             top_candidates.pop();
         }
         return result;
-    }
-
-    std::priority_queue<std::pair<Tdist, label_t>> searchKnn(const void* data_point, size_t k) const override {
-        return searchKnn<false>(k, data_point);
     }
 
 private:
@@ -922,11 +955,12 @@ public:
             throw std::runtime_error("out of memory");
         }
 
-        hnsw->bitlocks_ = malloc(hnsw->max_elements_ / 8 + 1);
+        size_t bitlock_len = hnsw->max_elements_ / 8 + 1;
+        hnsw->bitlocks_ = (uint8_t*)malloc(bitlock_len);
         if(hnsw->bitlocks_ == nullptr) {
             throw std::runtime_error("out of memory");
         }
-        memset(hnsw->bitlocks_, 0, hnsw->max_elements_ / 8 + 1);
+        memset(hnsw->bitlocks_, 0, bitlock_len);
 
         for(id_t id = 0; id < hnsw->max_elements_; id++) {
             int level;
@@ -964,11 +998,16 @@ public:
             }
         }
 
+        int ret = pthread_rwlock_init(&(hnsw->add_rwlock_), nullptr);
+        assert(ret == 0);
+
         hnsw->visited_list_pool_ = new VisitedListPool(hnsw->max_elements_);
 
         hnsw->metric_hops.store(0);
         hnsw->metric_distance_computations.store(0);
         
+        delete space;
+
         return hnsw;
     }
 
