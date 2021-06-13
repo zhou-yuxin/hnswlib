@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <time.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -372,7 +373,7 @@ private:
         return selected;
     }
 
-    id_t connectNeighbors(id_t id, candidates_t& top_candidates, int level) {
+    id_t connectNeighbors(id_t id, candidates_t& top_candidates, int level, bool with_backward) {
         assert(!top_candidates.empty());
 
         size_t cur_max_M = level ? max_M_ : max_M0_;
@@ -387,30 +388,32 @@ private:
             linklist->size = selected.size();
         }
 
-        for(id_t nn_id : selected) {
-            assert(nn_id != id);
-            SpinLock lock(bitlocks_, nn_id);
+        if(with_backward) {
+            for(id_t nn_id : selected) {
+                assert(nn_id != id);
+                SpinLock lock(bitlocks_, nn_id);
 
-            assert(levels_[nn_id] >= level);
-            LinkList* linklist = getLinkList(nn_id, level);
+                assert(levels_[nn_id] >= level);
+                LinkList* linklist = getLinkList(nn_id, level);
 
-            assert(linklist->size <= cur_max_M);
-            if(linklist->size < cur_max_M) {
-                linklist->ids[linklist->size] = id;
-                linklist->size++;
-            }
-            else {
-                const void* data = getData(nn_id);
-                candidates_t candidates;
-                candidates.emplace(dist_func_(data, getData(id), d_), id);
-                for(listsize_t i = 0; i < linklist->size; i++) {
-                    id_t id_i = linklist->ids[i];
-                    candidates.emplace(dist_func_(data, getData(id_i), d_), id_i);
+                assert(linklist->size <= cur_max_M);
+                if(linklist->size < cur_max_M) {
+                    linklist->ids[linklist->size] = id;
+                    linklist->size++;
                 }
-                std::vector<id_t> nn_selected = getNeighborsByHeuristic(candidates, cur_max_M);
-                linklist->size = 0;
-                memcpy(linklist->ids, nn_selected.data(), nn_selected.size() * sizeof(id_t));
-                linklist->size = nn_selected.size();
+                else {
+                    const void* data = getData(nn_id);
+                    candidates_t candidates;
+                    candidates.emplace(dist_func_(data, getData(id), d_), id);
+                    for(listsize_t i = 0; i < linklist->size; i++) {
+                        id_t id_i = linklist->ids[i];
+                        candidates.emplace(dist_func_(data, getData(id_i), d_), id_i);
+                    }
+                    std::vector<id_t> nn_selected = getNeighborsByHeuristic(candidates, cur_max_M);
+                    linklist->size = 0;
+                    memcpy(linklist->ids, nn_selected.data(), nn_selected.size() * sizeof(id_t));
+                    linklist->size = nn_selected.size();
+                }
             }
         }
 
@@ -587,11 +590,11 @@ public:
                         SpinLock lock(bitlocks_, cur_ep_id);
                         const LinkList* linklist = getLinkListN(cur_ep_id, l);
                         for(listsize_t i = 0; i < linklist->size; i++) {
-                            id_t cand_id = linklist->ids[i];
-                            Tdist dist = dist_func_(data, getData(cand_id), d_);
-                            if(dist < min_dist) {
-                                min_dist = dist;
-                                cur_ep_id = cand_id;
+                            id_t id_i = linklist->ids[i];
+                            Tdist dist_i = dist_func_(data, getData(id_i), d_);
+                            if(dist_i < min_dist) {
+                                min_dist = dist_i;
+                                cur_ep_id = id_i;
                                 changed = true;
                             }
                         }
@@ -602,7 +605,7 @@ public:
             for(int l = std::min(level, ep_level); l >= 0; l--) {
                 candidates_t top_candidates = searchLayer(cur_ep_id, data, l);
                 if(!top_candidates.empty()) {
-                    cur_ep_id = connectNeighbors(id, top_candidates, l);
+                    cur_ep_id = connectNeighbors(id, top_candidates, l, true);
                 }
             }
         }
@@ -741,7 +744,7 @@ public:
                     linklist->size = 0;
                 }
                 else {
-                    connectNeighbors(id, candidates, l);
+                    connectNeighbors(id, candidates, l, isEnabled(id));
                 }
             }
         }
@@ -807,21 +810,19 @@ public:
             while(changed) {
                 changed = false;
                 const LinkList* linklist = getLinkListN(ep_id, l);
+                for(listsize_t i = 0; i < linklist->size; i++) {
+                    id_t id_i = linklist->ids[i];
+                    assert(0 <= id_i && id_i < max_elements_);
+                    Tdist dist_i = st_dist_func_(data_point, getData(id_i), d_);
+                    if(dist_i < cur_dist) {
+                        cur_dist = dist_i;
+                        ep_id = id_i;
+                        changed = true;
+                    }
+                }
                 if(collect_metrics) {
                     hops++;
                     distance_computations += linklist->size;
-                }
-                for(listsize_t i = 0; i < linklist->size; i++) {
-                    id_t cand = linklist->ids[i];
-                    if(cand < 0 || cand >= max_elements_) {
-                        throw std::runtime_error("candidate error");
-                    }
-                    Tdist dist = st_dist_func_(data_point, getData(cand), d_);
-                    if(dist < cur_dist) {
-                        cur_dist = dist;
-                        ep_id = cand;
-                        changed = true;
-                    }
                 }
             }
         }
@@ -844,8 +845,6 @@ public:
     }
 
 private:
-    HierarchicalNSW() {}
-
     static void write(FILE* file, const void* buf, size_t len) {
         if(fwrite(buf, 1, len, file) != len) {
             throw std::runtime_error("failed to write to file");
@@ -873,6 +872,8 @@ private:
         size_t align_mod = offset % pgsize;
         return align_mod == 0 ? offset : offset + pgsize - align_mod;
     }
+
+    HierarchicalNSW() {}
 
 public:
     void save(FILE* file) const {
@@ -997,6 +998,8 @@ public:
                 hnsw->label_lookup_[hnsw->getExternalLabel(id)] = id;
             }
         }
+
+        hnsw->random_.seed(time(nullptr));
 
         int ret = pthread_rwlock_init(&(hnsw->add_rwlock_), nullptr);
         assert(ret == 0);
