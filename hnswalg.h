@@ -810,9 +810,14 @@ public:
             while(changed) {
                 changed = false;
                 const LinkList* linklist = getLinkListN(ep_id, l);
+#ifdef USE_SSE
+                _mm_prefetch(getData(linklist->ids[0]), _MM_HINT_T0);
+#endif
                 for(listsize_t i = 0; i < linklist->size; i++) {
                     id_t id_i = linklist->ids[i];
-                    assert(0 <= id_i && id_i < max_elements_);
+#ifdef USE_SSE
+                    _mm_prefetch(getData(linklist->ids[i + 1]), _MM_HINT_T0);
+#endif
                     Tdist dist_i = st_dist_func_(data_point, getData(id_i), d_);
                     if(dist_i < cur_dist) {
                         cur_dist = dist_i;
