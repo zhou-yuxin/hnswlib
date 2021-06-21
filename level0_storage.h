@@ -17,6 +17,14 @@ public:
         return buf;
     }
 
+    void* reallocate(void* buf, size_t size) override {
+        buf = realloc(buf, size);
+        if(buf == nullptr) {
+            throw std::runtime_error("out of memory");
+        }
+        return buf;
+    }
+
     void* load(FILE* file, size_t offset, size_t size) override {
         char* buf = (char*)malloc(size);
         if(buf == nullptr) {
@@ -41,6 +49,10 @@ class PmemLevel0 : public Level0StorageInterface {
 
 public:
     void* allocate(size_t /*size*/) override {
+        throw std::runtime_error("pmem is read only");
+    }
+
+    void* reallocate(void* buf, size_t size) override {
         throw std::runtime_error("pmem is read only");
     }
 

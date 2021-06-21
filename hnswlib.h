@@ -66,6 +66,8 @@ public:
 
     virtual void* allocate(size_t size) = 0;
 
+    virtual void* reallocate(void* buf, size_t size) = 0;
+
     virtual void* load(FILE* file, size_t offset, size_t size) = 0;
 
     virtual void free(void* buf, size_t size) = 0;

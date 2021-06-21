@@ -559,6 +559,45 @@ public:
         assert(ret == 0);
     }
 
+    void resize(size_t max_elements) {
+        if(max_elements <= max_elements_) {
+            throw std::runtime_error("max_element <= current max_elements_");
+        }
+
+        levels_ = (level_t*)realloc(levels_, sizeof(level_t) * max_elements);
+        if(levels_ == nullptr) {
+            throw std::runtime_error("out of memory");
+        }
+        memset(levels_ + max_elements_, 0,
+                sizeof(level_t) * (max_elements - max_elements_));
+
+        linklists_ = (void**)realloc(linklists_, sizeof(void*) * max_elements);
+        if(linklists_ == nullptr) {
+            throw std::runtime_error("out of memory");
+        }
+
+        size_t bitlock_len = max_elements / 8 + 1;
+        bitlocks_ = (uint8_t*)realloc(bitlocks_, bitlock_len);
+        if(bitlocks_ == nullptr) {
+            throw std::runtime_error("out of memory");
+        }
+        memset(bitlocks_, 0, bitlock_len);
+
+        size_t level0_len = size_data_per_element_ * max_elements;
+        level0_raw_memory_ = level0_storage_->reallocate(level0_raw_memory_, level0_len);
+        memset((char*)level0_raw_memory_ + size_data_per_element_ * max_elements_, 0,
+                size_data_per_element_ * (max_elements - max_elements_));
+
+        for(size_t i = max_elements_; i < max_elements; i++) {
+            free_ids_.push_back(i);
+        }
+
+        delete visited_list_pool_;
+        visited_list_pool_ = new VisitedListPool(max_elements);
+
+        max_elements_ = max_elements;
+    }
+
     inline size_t getM() const {
         return M_;
     }
