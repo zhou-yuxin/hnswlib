@@ -337,6 +337,9 @@ private:
             id_t cur_id = cur_pair.second;
             candidate_set.pop();
 
+#ifdef SEARCH_WITH_LOCK
+            SpinLock lock(bitlocks_, cur_id);
+#endif
             const LinkList* linklist = getLinkList0(cur_id);
 #ifdef USE_SSE
             _mm_prefetch(visited_array + linklist->ids[0], _MM_HINT_T0);
@@ -855,6 +858,9 @@ public:
             bool changed = true;
             while(changed) {
                 changed = false;
+#ifdef SEARCH_WITH_LOCK
+                SpinLock lock(bitlocks_, ep_id);
+#endif
                 const LinkList* linklist = getLinkListN(ep_id, l);
 #ifdef USE_SSE
                 _mm_prefetch(getData(linklist->ids[0]), _MM_HINT_T0);
