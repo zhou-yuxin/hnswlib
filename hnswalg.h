@@ -38,6 +38,55 @@ private:
         DISABLED = 2,
     };
 
+    struct LinklistPool {
+        std::mutex mutex;
+        std::vector<std::vector<void*>> pool;
+        const size_t linklist_size;
+
+        LinklistPool(size_t linklist_size): linklist_size(linklist_size) {}
+
+        ~LinklistPool() {
+            for(std::vector<void*>& sub_pool : pool) {
+                for(void* linklist : sub_pool) {
+                    ::free(linklist);
+                }
+            }
+        }
+
+        void* allocate(int level) {
+            assert(level > 0);
+            void* linklist = nullptr;
+            size_t len = linklist_size * level;
+            mutex.lock();
+            if(pool.size() >= size_t(level)) {
+                std::vector<void*>& sub_pool = pool[level - 1];
+                if(!sub_pool.empty()) {
+                    linklist = sub_pool.back();
+                    sub_pool.pop_back();
+                }
+            }
+            mutex.unlock();
+            if(linklist == nullptr) {
+                linklist = malloc(len);
+                if(linklist == nullptr) {
+                    throw std::runtime_error("out of memory");
+                }
+            }
+            memset(linklist, 0, len);
+            return linklist;
+        }
+
+        void free(int level, void* linklist) {
+            assert(level > 0);
+            std::unique_lock<std::mutex> lock(mutex);
+            if(pool.size() < size_t(level)) {
+                pool.resize(level);
+            }
+            std::vector<void*>& sub_pool = pool[level - 1];
+            sub_pool.push_back(linklist);
+        }
+    };
+
     struct SpinLock {
         volatile uint8_t* byte;
         uint8_t mask;
@@ -97,6 +146,7 @@ private:
     size_t max_M_;
     size_t max_M0_;
     size_t ef_construction_;
+    size_t ef_;
 
     double mult_;
     size_t raw_data_size_;
@@ -131,7 +181,7 @@ private:
     std::mutex global_lock_;
     pthread_rwlock_t add_rwlock_;
 
-    size_t ef_;
+    LinklistPool* linklist_pool_;
     VisitedListPool* visited_list_pool_;
 
 public:
@@ -428,6 +478,7 @@ public:
         max_M_ = M_;
         max_M0_ = M_ * 2;
         ef_construction_ = std::max(ef_construction, M_);
+        ef_ = 10;
 
         mult_ = 1.0 / log(1.0 * M_);
         raw_data_size_ = space->getRawDataSize();
@@ -479,7 +530,7 @@ public:
         int ret = pthread_rwlock_init(&add_rwlock_, nullptr);
         assert(ret == 0);
 
-        ef_ = 10;
+        linklist_pool_ = new LinklistPool(size_links_per_element_);
         visited_list_pool_ = new VisitedListPool(max_elements_);
 
         metric_hops.store(0);
@@ -499,6 +550,7 @@ public:
         free(linklists_);
         level0_storage_->free(level0_raw_memory_, max_elements_ * size_data_per_element_);
         delete level0_storage_;
+        delete linklist_pool_;
         delete visited_list_pool_;
         int ret = pthread_rwlock_destroy(&add_rwlock_);
         assert(ret == 0);
@@ -513,7 +565,7 @@ public:
     }
 
     inline void setEfConstruction(size_t ef) {
-        ef_construction_ = ef;
+        ef_construction_ = std::max(ef, M_);
     }
 
     inline size_t getEfSearch() const {
@@ -570,13 +622,7 @@ public:
             }
             setExternalLabel(id, label);
             if(level) {
-                size_t listsize = size_links_per_element_ * level;
-                void* linklist = malloc(listsize);
-                if(linklist == nullptr) {
-                    throw std::runtime_error("out of memory");
-                }
-                memset(linklist, 0, listsize);
-                linklists_[id] = linklist;
+                linklists_[id] = linklist_pool_->allocate(level);
             }
         }
 
@@ -778,7 +824,7 @@ public:
             if(!(linked_bitmap[id / 8] & (1 << (id % 8)))) {
                 setStatus(id, Status::FREE);
                 if(levels_[id] > 0) {
-                    free(linklists_[id]);
+                    linklist_pool_->free(levels_[id], linklists_[id]);
                     levels_[id] = 0;
                 }
                 #pragma omp critical
@@ -1009,6 +1055,7 @@ public:
         int ret = pthread_rwlock_init(&(hnsw->add_rwlock_), nullptr);
         assert(ret == 0);
 
+        hnsw->linklist_pool_ = new LinklistPool(hnsw->size_links_per_element_);
         hnsw->visited_list_pool_ = new VisitedListPool(hnsw->max_elements_);
 
         hnsw->metric_hops.store(0);
