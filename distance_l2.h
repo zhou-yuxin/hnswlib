@@ -132,7 +132,7 @@ static float L2Sqr(const bfp16_t* a, const bfp16_t* b, size_t d) {
 #endif
 }
 
-static int L2Sqr(const int16_t* a, const int16_t* b, size_t d) {
+static int64_t L2Sqr(const int16_t* a, const int16_t* b, size_t d) {
 #ifdef USE_SSE
 #ifdef USE_AVX
 #ifdef USE_AVX512
@@ -146,11 +146,14 @@ static int L2Sqr(const int16_t* a, const int16_t* b, size_t d) {
         msum512 = _mm512_add_epi32(msum512, _mm512_mullo_epi32(mdiff, mdiff));
         d -= 16;
     }
+    msum512 = _mm512_add_epi64(
+            _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(msum512, 1)),
+            _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(msum512, 0)));
     if(d == 0) {
-        return _mm512_reduce_add_epi32(msum512);
+        return _mm512_reduce_add_epi64(msum512);
     }
-    __m256i msum256 = _mm512_extracti32x8_epi32(msum512, 1);
-    msum256 = _mm256_add_epi32(msum256, _mm512_extracti32x8_epi32(msum512, 0));
+    __m256i msum256 = _mm512_extracti64x4_epi64(msum512, 1);
+    msum256 = _mm256_add_epi64(msum256, _mm512_extracti64x4_epi64(msum512, 0));
     if(d >= 8) {
 #else
     __m256i msum256 = _mm256_setzero_si256();
@@ -160,12 +163,14 @@ static int L2Sqr(const int16_t* a, const int16_t* b, size_t d) {
         a += 8;
         __m256i mb = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i_u*)b));
         b += 8;
-        __m256i mdiff = _mm256_sub_epi32(ma, mb);
-        msum256 = _mm256_add_epi32(msum256, _mm256_mullo_epi32(mdiff, mdiff));
+        __m256i mmul = _mm256_sub_epi32(ma, mb);
+        mmul = _mm256_mullo_epi32(mmul, mmul);
+        msum256= _mm256_add_epi64(msum256, _mm256_cvtepi32_epi64(
+                _mm_add_epi32(_mm256_extracti128_si256(mmul, 1), _mm256_extracti128_si256(mmul, 0))));
         d -= 8;
     }
     __m128i msum128 = _mm256_extracti128_si256(msum256, 1);
-    msum128 = _mm_add_epi32(msum128, _mm256_extracti128_si256(msum256, 0));
+    msum128 = _mm_add_epi64(msum128, _mm256_extracti128_si256(msum256, 0));
     if(d >= 4) {
 #else
     __m128i msum128 = _mm_setzero_si128();
@@ -175,16 +180,15 @@ static int L2Sqr(const int16_t* a, const int16_t* b, size_t d) {
         a += 4;
         __m128i mb = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i_u*)b));
         b += 4;
-        __m128i mdiff = _mm_sub_epi32(ma, mb);
-        msum128 = _mm_add_epi32(msum128, _mm_mullo_epi32(mdiff, mdiff));
+        __m128i mmul = _mm_sub_epi32(ma, mb);
+        mmul = _mm_mullo_epi32(mmul, mmul);
+        msum128 = _mm_add_epi64(msum128, _mm_cvtepi32_epi64(_mm_hadd_epi32(mmul, mmul)));
         d -= 4;
     }
-    msum128 = _mm_hadd_epi32(msum128, msum128);
-    msum128 = _mm_hadd_epi32(msum128, msum128);
-    int sum = _mm_cvtsi128_si32(msum128);
-    return d ? sum + L2SqrRef<int, int16_t>(a, b, d) : sum;
+    int64_t sum = _mm_extract_epi64(msum128, 1) + _mm_extract_epi64(msum128, 0);
+    return d ? sum + InnerProductRef<int64_t, int16_t>(a, b, d) : sum;
 #else
-    return L2SqrRef<int, int16_t>(a, b, d);
+    return L2SqrRef<int64_t, int16_t>(a, b, d);
 #endif
 }
 
